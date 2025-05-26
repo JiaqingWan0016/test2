@@ -839,6 +839,462 @@ static const struct nla_policy vxlan_policy[IFLA_VXLAN_MAX + 1] = {
 
 通过这些参数，Linux 内核的 VXLAN 实现提供了丰富的功能，包括标准 VXLAN 协议支持、多种扩展支持、性能优化选项以及与其他网络虚拟化技术的集成。
 
+# VXLAN FDB 管理函数分析
+
+通过分析 vxlan.c 文件中的 `vxlan_fdb_add` 和 `vxlan_fdb_dump` 函数，我们可以了解 VXLAN 转发数据库(FDB)的管理机制。这两个函数分别负责添加 FDB 表项和显示 FDB 表内容。
+
+## 1. vxlan_fdb_add 函数分析
+
+`vxlan_fdb_add` 函数用于向 VXLAN 设备的转发数据库中添加一个新的表项，将 MAC 地址与远程 VTEP 地址关联起来。
+
+### 函数实现分析
+
+```c
+static int vxlan_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
+                         struct net_device *dev,
+                         const unsigned char *addr, u16 vid, u16 flags)
+{
+    struct vxlan_dev *vxlan = netdev_priv(dev);
+    /* 用于存储远程 VTEP 地址 */
+    union vxlan_addr ip;
+    __be16 port;
+    __be32 src_vni, vni;
+    u32 ifindex;
+    int err;
+
+    /* 解析 netlink 属性 */
+    err = vxlan_fdb_parse(tb, vxlan, &ip, &port, &src_vni, &vni, &ifindex);
+    if (err)
+        return err;
+
+    /* 检查 VXLAN 设备是否支持 FDB 操作 */
+    if (!(vxlan->cfg.flags & VXLAN_F_LEARN))
+        return -EOPNOTSUPP;
+
+    /* 检查是否为本地条目 */
+    if (flags & NLM_F_REPLACE)
+        return -EOPNOTSUPP;
+
+    if (is_multicast_ether_addr(addr) || is_zero_ether_addr(addr))
+        return -EINVAL;
+
+    /* 更新 FDB 表 */
+    spin_lock_bh(&vxlan->hash_lock);
+    err = vxlan_fdb_update(vxlan, addr, &ip, ndm->ndm_state, flags,
+                          port, src_vni, vni, ifindex, ndm->ndm_flags);
+    spin_unlock_bh(&vxlan->hash_lock);
+
+    return err;
+}
+```
+
+### 主要流程
+
+1. **参数解析**：
+   - 调用 `vxlan_fdb_parse` 解析 netlink 属性，获取远程 VTEP 地址、端口、VNI 等信息
+
+2. **参数验证**：
+   - 检查 VXLAN 设备是否支持 FDB 操作（必须启用学习功能）
+   - 检查是否为替换操作（不支持）
+   - 验证 MAC 地址是否有效（不能是多播或全零地址）
+
+3. **更新 FDB 表**：
+   - 获取 VXLAN 设备的哈希锁
+   - 调用 `vxlan_fdb_update` 更新 FDB 表
+   - 释放哈希锁
+
+4. **返回结果**：
+   - 返回操作结果（成功或错误码）
+
+### vxlan_fdb_parse 函数
+
+`vxlan_fdb_parse` 函数负责从 netlink 属性中解析 FDB 表项的各个字段：
+
+```c
+static int vxlan_fdb_parse(struct nlattr *tb[], struct vxlan_dev *vxlan,
+                          union vxlan_addr *ip, __be16 *port,
+                          __be32 *src_vni, __be32 *vni, u32 *ifindex)
+{
+    struct net_device *dev = vxlan->dev;
+    
+    /* 初始化默认值 */
+    *port = vxlan->cfg.dst_port;
+    *vni = vxlan->default_dst.remote_vni;
+    *src_vni = vxlan->default_dst.remote_vni;
+    *ifindex = 0;
+
+    /* 解析远程 IP 地址 */
+    if (tb[NDA_DST]) {
+        if (nla_len(tb[NDA_DST]) != sizeof(union vxlan_addr))
+            return -EAFNOSUPPORT;
+        memcpy(ip, nla_data(tb[NDA_DST]), sizeof(union vxlan_addr));
+    } else {
+        /* 没有指定远程 IP，使用默认值 */
+        *ip = vxlan->default_dst.remote_ip;
+    }
+
+    /* 解析端口 */
+    if (tb[NDA_PORT])
+        *port = nla_get_be16(tb[NDA_PORT]);
+
+    /* 解析 VNI */
+    if (tb[NDA_VNI])
+        *vni = nla_get_be32(tb[NDA_VNI]);
+
+    /* 解析源 VNI */
+    if (tb[NDA_SRC_VNI])
+        *src_vni = nla_get_be32(tb[NDA_SRC_VNI]);
+
+    /* 解析接口索引 */
+    if (tb[NDA_IFINDEX])
+        *ifindex = nla_get_u32(tb[NDA_IFINDEX]);
+
+    return 0;
+}
+```
+
+### vxlan_fdb_update 函数
+
+`vxlan_fdb_update` 函数负责实际更新 FDB 表：
+
+```c
+static int vxlan_fdb_update(struct vxlan_dev *vxlan,
+                           const unsigned char *addr,
+                           union vxlan_addr *ip,
+                           __u16 state, __u16 flags,
+                           __be16 port, __be32 src_vni, __be32 vni,
+                           __u32 ifindex, __u16 ndm_flags)
+{
+    struct vxlan_fdb *f;
+    struct vxlan_rdst *rd = NULL;
+    int err;
+
+    /* 查找现有 FDB 条目 */
+    f = vxlan_find_mac(vxlan, addr, vni);
+    if (f) {
+        /* 条目已存在，更新它 */
+        if (flags & NLM_F_EXCL)
+            return -EEXIST;
+
+        /* 查找远程目标 */
+        rd = vxlan_fdb_find_rdst(f, ip, port, ifindex, src_vni);
+        if (rd) {
+            /* 远程目标已存在，更新状态 */
+            rd->state = state;
+            rd->remote_port = port;
+            rd->remote_vni = src_vni;
+            rd->remote_ifindex = ifindex;
+            goto out;
+        }
+
+        /* 添加新的远程目标 */
+        if (!(flags & NLM_F_APPEND))
+            return -EEXIST;
+    } else {
+        /* 条目不存在，创建新条目 */
+        if (!(flags & NLM_F_CREATE))
+            return -ENOENT;
+
+        /* 创建新的 FDB 条目 */
+        f = vxlan_fdb_create(vxlan, addr, vni, ndm_flags);
+        if (IS_ERR(f))
+            return PTR_ERR(f);
+    }
+
+    /* 创建新的远程目标 */
+    rd = vxlan_fdb_create_rdst(f, ip, port, src_vni, ifindex, state);
+    if (IS_ERR(rd)) {
+        err = PTR_ERR(rd);
+        if (f && list_empty(&f->remotes))
+            vxlan_fdb_destroy(vxlan, f, false);
+        return err;
+    }
+
+out:
+    /* 更新时间戳 */
+    f->updated = jiffies;
+    if (flags & NLM_F_REPLACE)
+        f->flags = ndm_flags;
+    
+    return 0;
+}
+```
+
+### 流程图 - vxlan_fdb_add
+
+```
+vxlan_fdb_add 函数流程图
+┌─────────────────────────────────┐
+│ 开始 vxlan_fdb_add              │
+└───────────────┬─────────────────┘
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 解析 netlink 属性                ├─失败► 返回错误        │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 成功
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 检查 VXLAN 设备是否支持 FDB 操作 ├─否──► 返回 -EOPNOTSUPP │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 是
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 检查是否为替换操作               ├─是──► 返回 -EOPNOTSUPP │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 否
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 验证 MAC 地址是否有效            ├─无效► 返回 -EINVAL     │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 有效
+                ▼
+┌─────────────────────────────────┐
+│ 获取 VXLAN 设备的哈希锁          │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 调用 vxlan_fdb_update 更新 FDB 表│
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 释放哈希锁                       │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 返回操作结果                     │
+└─────────────────────────────────┘
+```
+
+## 2. vxlan_fdb_dump 函数分析
+
+`vxlan_fdb_dump` 函数用于显示 VXLAN 设备的 FDB 表内容，通常由 `bridge fdb show` 命令调用。
+
+### 函数实现分析
+
+```c
+static int vxlan_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+                         struct net_device *dev,
+                         struct net_device *filter_dev, int *idx)
+{
+    struct vxlan_dev *vxlan = netdev_priv(dev);
+    struct vxlan_fdb *f;
+    int err = 0;
+    u32 portid = NETLINK_CB(cb->skb).portid;
+    u32 seq = cb->nlh->nlmsg_seq;
+    struct nlmsghdr *nlh;
+    struct ndmsg *ndm;
+    int h;
+
+    /* 遍历 FDB 哈希表的所有桶 */
+    for (h = 0; h < VXLAN_N_VID; ++h) {
+        struct hlist_head *head = &vxlan->fdb_head[h];
+        
+        /* 获取读锁 */
+        rcu_read_lock();
+        
+        /* 遍历哈希桶中的所有条目 */
+        hlist_for_each_entry_rcu(f, head, hlist) {
+            struct vxlan_rdst *rd;
+            
+            /* 跳过已经处理过的条目 */
+            if (*idx < cb->args[2])
+                goto skip;
+
+            /* 遍历条目的所有远程目标 */
+            list_for_each_entry_rcu(rd, &f->remotes, list) {
+                /* 创建 netlink 消息 */
+                nlh = nlmsg_put(skb, portid, seq, RTM_NEWNEIGH,
+                               sizeof(*ndm), NLM_F_MULTI);
+                if (nlh == NULL) {
+                    rcu_read_unlock();
+                    err = -EMSGSIZE;
+                    goto out;
+                }
+
+                /* 填充 ndmsg 结构 */
+                ndm = nlmsg_data(nlh);
+                ndm->ndm_family = AF_BRIDGE;
+                ndm->ndm_pad1 = 0;
+                ndm->ndm_pad2 = 0;
+                ndm->ndm_flags = f->flags;
+                ndm->ndm_type = 0;
+                ndm->ndm_ifindex = dev->ifindex;
+                ndm->ndm_state = rd->state;
+
+                /* 添加 MAC 地址 */
+                if (nla_put(skb, NDA_LLADDR, ETH_ALEN, f->eth_addr))
+                    goto nla_put_failure;
+
+                /* 添加 VNI */
+                if (nla_put_be32(skb, NDA_VNI, f->vni))
+                    goto nla_put_failure;
+
+                /* 添加远程 IP 地址 */
+                if (nla_put(skb, NDA_DST, sizeof(rd->remote_ip),
+                           &rd->remote_ip))
+                    goto nla_put_failure;
+
+                /* 添加端口 */
+                if (rd->remote_port &&
+                    rd->remote_port != vxlan->cfg.dst_port &&
+                    nla_put_be16(skb, NDA_PORT, rd->remote_port))
+                    goto nla_put_failure;
+
+                /* 添加源 VNI */
+                if (rd->remote_vni != f->vni &&
+                    nla_put_be32(skb, NDA_SRC_VNI, rd->remote_vni))
+                    goto nla_put_failure;
+
+                /* 添加接口索引 */
+                if (rd->remote_ifindex &&
+                    nla_put_u32(skb, NDA_IFINDEX, rd->remote_ifindex))
+                    goto nla_put_failure;
+
+                nlmsg_end(skb, nlh);
+            }
+skip:
+            (*idx)++;
+        }
+        rcu_read_unlock();
+    }
+out:
+    return err;
+
+nla_put_failure:
+    rcu_read_unlock();
+    nlmsg_cancel(skb, nlh);
+    return -EMSGSIZE;
+}
+```
+
+### 主要流程
+
+1. **遍历 FDB 哈希表**：
+   - 遍历 VXLAN 设备的 FDB 哈希表的所有桶
+
+2. **遍历哈希桶中的条目**：
+   - 对每个哈希桶，遍历其中的所有 FDB 条目
+   - 使用 RCU 读锁保护遍历过程
+
+3. **遍历条目的远程目标**：
+   - 对每个 FDB 条目，遍历其关联的所有远程目标
+
+4. **构建 netlink 消息**：
+   - 为每个远程目标创建一个 netlink 消息
+   - 填充 ndmsg 结构体
+   - 添加各种属性（MAC 地址、VNI、远程 IP 等）
+
+5. **发送消息**：
+   - 完成消息构建并发送给用户空间
+
+### 流程图 - vxlan_fdb_dump
+
+```
+vxlan_fdb_dump 函数流程图
+┌─────────────────────────────────┐
+│ 开始 vxlan_fdb_dump             │
+└───────────────┬─────────────────┘
+                ▼
+┌─────────────────────────────────┐
+│ 初始化变量                       │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 遍历 FDB 哈希表的所有桶          │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 获取 RCU 读锁                    │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 遍历哈希桶中的所有 FDB 条目      │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 检查是否需要跳过当前条目         ├─是──► 跳到下一个条目   │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 否
+                ▼
+┌─────────────────────────────────┐
+│ 遍历条目的所有远程目标           │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 创建 netlink 消息                ├─失败► 释放锁并返回错误 │
+└───────────────┬─────────────────┘     └─────────────────┘
+                │ 成功
+                ▼
+┌─────────────────────────────────┐
+│ 填充 ndmsg 结构体                │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 添加 MAC 地址属性                ├─失败► 取消消息并返回   │
+└───────────────┬─────────────────┘     │ 错误            │
+                │ 成功                   └─────────────────┘
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 添加 VNI 属性                    ├─失败► 取消消息并返回   │
+└───────────────┬─────────────────┘     │ 错误            │
+                │ 成功                   └─────────────────┘
+                ▼
+┌─────────────────────────────────┐     ┌─────────────────┐
+│ 添加远程 IP 地址属性             ├─失败► 取消消息并返回   │
+└───────────────┬─────────────────┘     │ 错误            │
+                │ 成功                   └─────────────────┘
+                ▼
+┌─────────────────────────────────┐
+│ 添加其他可选属性                 │
+│ (端口、源 VNI、接口索引)         │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 完成消息并发送                   │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 增加索引计数器                   │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 释放 RCU 读锁                    │
+└───────────────┬─────────────────┘
+                │
+                ▼
+┌─────────────────────────────────┐
+│ 返回操作结果                     │
+└─────────────────────────────────┘
+```
+
+## 总结
+
+1. **vxlan_fdb_add 函数**:
+   - 负责向 VXLAN 设备的 FDB 表中添加新的表项
+   - 解析 netlink 属性获取远程 VTEP 信息
+   - 验证参数的合法性
+   - 更新 FDB 表，添加或修改表项
+
+2. **vxlan_fdb_dump 函数**:
+   - 负责显示 VXLAN 设备的 FDB 表内容
+   - 遍历 FDB 哈希表的所有条目
+   - 为每个条目构建 netlink 消息
+   - 将消息发送给用户空间
+
+这两个函数是 VXLAN FDB 管理的核心，它们通过 netlink 接口与用户空间通信，使用户可以通过 `bridge fdb` 命令管理 VXLAN 的转发表。FDB 表维护了 MAC 地址与远程 VTEP 的映射关系，是 VXLAN 网络正常工作的关键组件。
+
 # VXLAN 设备创建函数 __vxlan_dev_create 实现分析
 
 `__vxlan_dev_create` 函数是 VXLAN 模块中负责创建 VXLAN 设备的核心函数。这个函数负责分配和初始化 VXLAN 设备的各种资源，并将其注册到网络子系统中。下面我将分析其实现并提供流程图。
