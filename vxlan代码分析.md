@@ -1,10 +1,20 @@
 # Linux 内核中 VXLAN 实现分析
 
-从提供的 vxlan.c 和 vxlan.h 文件中，我们可以分析 Linux 内核中 VXLAN (Virtual eXtensible Local Area Network) 的实现。这是一个网络虚拟化技术，允许在现有的三层网络上创建二层覆盖网络。
+## 1. 引言
 
-## 核心数据结构
+VXLAN (Virtual eXtensible Local Area Network) 是一种网络虚拟化技术，允许在现有的三层网络上创建二层覆盖网络。它通过将二层以太网帧封装在 UDP 数据包中，实现了跨越三层网络的二层通信。本文分析 Linux 内核中 VXLAN 的实现，基于 vxlan.c 和 vxlan.h 文件。
 
-### 1. VXLAN 头部结构
+### 1.1 VXLAN 基本原理
+
+VXLAN 通过以下方式工作：
+- 使用 24 位的 VNI (VXLAN Network Identifier) 标识不同的虚拟网络
+- 将原始以太网帧封装在 UDP 数据包中
+- 使用 VTEP (VXLAN Tunnel End Point) 进行封装和解封装
+- 支持单播和多播传输模式
+
+## 2. 核心数据结构
+
+### 2.1 VXLAN 头部结构
 
 在 vxlan.h 中定义了 VXLAN 协议头部：
 
@@ -17,7 +27,7 @@ struct vxlanhdr {
 
 这是标准 VXLAN 头部，包含标志位和 VNI (VXLAN Network Identifier)。
 
-### 2. 扩展头部
+### 2.2 扩展头部
 
 VXLAN 支持多种扩展：
 
@@ -25,7 +35,7 @@ VXLAN 支持多种扩展：
 - **GPE (Generic Protocol Extension)**: 通过 `struct vxlanhdr_gpe` 实现
 - **远程校验和卸载**: 使用 `VXLAN_HF_RCO` 标志
 
-### 3. 主要结构体
+### 2.3 主要结构体
 
 ```c
 /* 每个网络命名空间的 VXLAN 私有数据 */
